@@ -37,8 +37,12 @@ def run_inference():
 
     model = DQN(state_dim, action_dim).to(device)
 
-    # train.py 에서 저장한 policy network 가중치를 불러옵니다.
-    model_path = Path("saved_models/dqn_cartpole_policy.pth")
+    # train.py 에서 저장한 가중치 중, 학습 중 평가 점수가 가장 높았던 시점의
+    # best 모델을 우선 사용하고, 없으면 마지막 에피소드의 가중치를 사용합니다.
+    best_path = Path("saved_models/dqn_cartpole_best.pth")
+    final_path = Path("saved_models/dqn_cartpole_policy.pth")
+    model_path = best_path if best_path.exists() else final_path
+    print(f"모델을 불러옵니다: {model_path}")
     model.load_state_dict(torch.load(model_path, map_location=device))
     model.eval()
 

@@ -17,8 +17,8 @@ import torch.optim as optim
 
 
 # 하나의 경험(transition)을 저장하기 위한 자료형입니다.
-# state: 현재 상태 / action: 선택한 행동 / reward: 받은 보상
-# next_state: 다음 상태 / done: 에피소드 종료 여부
+# state: 현재 상태 / action: 선택한 행동 / reward: 받은 보상 / next_state: 다음 상태
+# done: 막대가 쓰러져 "실패"로 끝났는지 여부 (terminated만 저장, 시간 초과 truncated는 제외)
 Transition = namedtuple("Transition", ["state", "action", "reward", "next_state", "done"])
 
 
@@ -57,7 +57,7 @@ class DQN(nn.Module):
 
 
 def save_model(model, save_path: Path):
-    # 학습이 끝난 정책 네트워크의 가중치를 파일로 저장합니다.
+    # 정책 네트워크의 가중치를 파일로 저장합니다.
     # evaluate.py 에서 이 가중치를 다시 불러와 사용합니다.
     save_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(model.state_dict(), save_path)
@@ -98,19 +98,45 @@ def optimize_model(policy_net, target_net, memory, optimizer, batch_size, gamma,
 
     # 타깃값 r + gamma * max_a' Q_target(s', a'):
     # 타깃 네트워크로 다음 상태의 최대 Q값을 계산합니다.
-    # done이면 다음 상태가 없으므로 (1 - dones)를 곱해 보상만 남깁니다.
+    # 실패(terminated)면 다음 상태가 없으므로 (1 - dones)를 곱해 보상만 남깁니다.
     with torch.no_grad():
         max_next_q = target_net(next_states).max(dim=1, keepdim=True)[0]
         target_q = rewards + gamma * max_next_q * (1 - dones)
 
-    # DQN의 손실은 예측 Q값과 타깃 Q값의 차이(MSE)입니다.
-    loss = nn.MSELoss()(current_q, target_q)
+    # 손실은 예측 Q값과 타깃 Q값의 차이입니다.
+    # MSE 대신 Huber(SmoothL1)를 쓰면 타깃이 크게 튀는 샘플에서
+    # 그래디언트가 폭주하는 것을 막아 학습이 더 안정적입니다.
+    loss = nn.SmoothL1Loss()(current_q, target_q)
 
     optimizer.zero_grad()
     loss.backward()
+    # 그래디언트 크기를 제한해서 한 번의 업데이트로 네트워크가 망가지는 것을 방지합니다.
+    nn.utils.clip_grad_norm_(policy_net.parameters(), 10.0)
     optimizer.step()
 
     return loss.item()
+
+
+def evaluate_policy(policy_net, device, num_episodes: int = 5):
+    # 진짜 평가지표: 탐험(epsilon) 없이 greedy 정책만으로 몇 판을 돌려 평균 점수를 잽니다.
+    # 학습 중 점수는 무작위 탐험이 섞여 있어 정책의 실제 실력보다 낮게 나오고,
+    # TD loss는 타깃이 계속 움직여서 성능 지표가 될 수 없기 때문입니다.
+    eval_env = gym.make("CartPole-v1")
+    total = 0.0
+
+    for _ in range(num_episodes):
+        state, _ = eval_env.reset()
+        done = False
+        while not done:
+            state_tensor = torch.tensor(state, dtype=torch.float32, device=device).unsqueeze(0)
+            with torch.no_grad():
+                action = int(torch.argmax(policy_net(state_tensor), dim=1).item())
+            state, reward, terminated, truncated, _ = eval_env.step(action)
+            done = terminated or truncated
+            total += reward
+
+    eval_env.close()
+    return total / num_episodes
 
 
 def moving_average(values, window_size: int):
@@ -122,8 +148,9 @@ def moving_average(values, window_size: int):
     return averaged
 
 
-def save_training_log(log_dir: Path, scores, avg_scores, losses, epsilons):
+def save_training_log(log_dir: Path, scores, avg_scores, losses, epsilons, eval_episodes, eval_scores):
     # 학습이 끝난 뒤 다시 분석할 수 있도록 로그를 CSV 파일로 저장합니다.
+    # loss는 성능 지표가 아니라 발산 여부를 확인하는 진단용으로만 남겨둡니다.
     log_dir.mkdir(parents=True, exist_ok=True)
     csv_path = log_dir / "training_log.csv"
 
@@ -136,27 +163,41 @@ def save_training_log(log_dir: Path, scores, avg_scores, losses, epsilons):
 
     print(f"학습 로그를 저장했습니다: {csv_path}")
 
+    # greedy 평가 점수는 별도 파일로 저장합니다.
+    eval_path = log_dir / "eval_log.csv"
+    with eval_path.open("w", encoding="utf-8") as file:
+        file.write("episode,eval_score\n")
+        for episode, eval_score in zip(eval_episodes, eval_scores):
+            file.write(f"{episode},{eval_score}\n")
 
-def plot_training_log(log_dir: Path, scores, avg_scores, losses):
-    # 학습 종료 후 점수와 손실 변화를 그래프로 저장하고 화면에 띄웁니다.
+    print(f"평가 로그를 저장했습니다: {eval_path}")
+
+
+def plot_training_log(log_dir: Path, scores, avg_scores, eval_episodes, eval_scores, solved_threshold):
+    # 학습 종료 후 학습 점수(탐험 포함)와 평가 점수(greedy)를 나란히 그립니다.
     episodes = np.arange(1, len(scores) + 1)
 
     plt.figure(figsize=(12, 5))
 
+    # 왼쪽: 학습 중 epsilon-greedy 정책(행동 정책)의 점수. 탐험이 섞여 있어 참고용입니다.
     plt.subplot(1, 2, 1)
     plt.plot(episodes, scores, label="Score per episode", alpha=0.6)
     plt.plot(episodes, avg_scores, label="Moving average (20)", linewidth=2)
-    plt.title("DQN CartPole Score")
+    plt.title("Training Score (epsilon-greedy)")
     plt.xlabel("Episode")
     plt.ylabel("Score")
     plt.legend()
     plt.grid(True, alpha=0.3)
 
+    # 오른쪽: greedy 정책의 평가 점수. 정책의 실제 실력은 이 곡선으로 판단합니다.
     plt.subplot(1, 2, 2)
-    plt.plot(episodes, losses, label="Loss", color="tomato")
-    plt.title("DQN CartPole Loss")
+    plt.plot(eval_episodes, eval_scores, label="Greedy eval (5 ep avg)", color="seagreen", marker="o")
+    plt.axhline(y=solved_threshold, color="gray", linestyle="--", alpha=0.7,
+                label=f"Solved ({solved_threshold:.0f})")
+    plt.title("Evaluation Score (greedy)")
     plt.xlabel("Episode")
-    plt.ylabel("Loss")
+    plt.ylabel("Score")
+    plt.ylim(0, 520)
     plt.legend()
     plt.grid(True, alpha=0.3)
 
@@ -186,7 +227,7 @@ def train():
     optimizer = optim.Adam(policy_net.parameters(), lr=1e-3)
     memory = ReplayBuffer(capacity=10000)
 
-    num_episodes = 300
+    num_episodes = 800  # 최대 에피소드 수 (epsilon이 하한 0.05에 도달하는 데 약 600 에피소드가 필요)
     batch_size = 64
     gamma = 0.99  # 미래 보상 할인율
 
@@ -195,30 +236,47 @@ def train():
     epsilon_decay = 0.995  # 매 에피소드 후 epsilon에 곱하는 감소율
 
     target_update_interval = 10  # 10 에피소드마다 target_net에 policy_net 가중치를 복사
+    eval_interval = 10  # 10 에피소드마다 greedy 정책으로 평가
+    best_eval_score = -float("inf")
+
+    max_steps = 500  # CartPole-v1은 500스텝에서 에피소드가 강제 종료됩니다
+
+    # 조기 종료 기준: 최대 점수(max_steps)의 95% = 475점.
+    # CartPole-v1의 공식 "solved" 기준이 475점이라 0.95를 기본값으로 씁니다.
+    # 더 느슨하게 하고 싶으면 비율만 낮추면 됩니다 (예: 0.8 → 400점).
+    solved_ratio = 0.95
+    solved_threshold = max_steps * solved_ratio
 
     scores = []
     avg_scores = []
     losses = []
     epsilons = []
+    eval_episodes = []
+    eval_scores = []
     log_dir = Path("training_logs")
     model_dir = Path("saved_models")
     model_path = model_dir / "dqn_cartpole_policy.pth"
+    best_model_path = model_dir / "dqn_cartpole_best.pth"
 
     for episode in range(1, num_episodes + 1):
         state, _ = env.reset()
         total_reward = 0
         episode_losses = []
 
-        # CartPole-v1은 최대 500스텝에서 에피소드가 종료됩니다.
-        for step in range(1, 501):
+        for step in range(1, max_steps + 1):
             action = choose_action(state, policy_net, epsilon, action_dim, device)
 
             next_state, reward, terminated, truncated, _ = env.step(action)
             done = terminated or truncated
 
+            # 주의: 버퍼에는 done이 아니라 terminated만 저장합니다.
+            # truncated(500스텝 시간 초과)는 실패한 게 아니라 시간이 다 된 것뿐이므로,
+            # 이때 다음 상태 가치를 0으로 만들면(done 취급) "오래 버틴 상태는 가치가 낮다"는
+            # 잘못된 신호를 학습해 후반 성능이 무너지는 원인이 됩니다.
+            memory.push(state, action, reward, next_state, terminated)
+
             # 환경 진행은 스텝마다 순차적으로 이루어지고,
             # 학습은 버퍼에서 랜덤하게 뽑은 과거 경험 배치로 이루어집니다.
-            memory.push(state, action, reward, next_state, done)
             loss = optimize_model(
                 policy_net=policy_net,
                 target_net=target_net,
@@ -259,15 +317,28 @@ def train():
             f"Loss: {mean_loss:.4f}"
         )
 
-        # 최근 20판 평균이 충분히 높으면 학습 성공으로 보고 조기 종료합니다.
-        if avg_score >= 475:
-            print("학습이 충분히 진행되어 조기 종료합니다.")
-            break
+        # 주기적으로 greedy 정책을 평가합니다. 조기 종료와 best 모델 판단은
+        # 탐험이 섞인 학습 점수가 아니라 이 평가 점수로 합니다.
+        if episode % eval_interval == 0:
+            eval_score = evaluate_policy(policy_net, device)
+            eval_episodes.append(episode)
+            eval_scores.append(eval_score)
+            print(f"  [평가] greedy 정책 5판 평균: {eval_score:.1f}")
+
+            # 지금까지 중 가장 잘하는 시점의 가중치를 따로 저장해 둡니다.
+            # (DQN은 학습이 출렁거려서 마지막 모델이 최고 모델이 아닐 수 있습니다)
+            if eval_score > best_eval_score:
+                best_eval_score = eval_score
+                save_model(policy_net, best_model_path)
+
+            if eval_score >= solved_threshold:
+                print(f"greedy 평가 점수가 기준({solved_threshold:.0f}점)을 넘어 학습을 조기 종료합니다.")
+                break
 
     env.close()
     save_model(policy_net, model_path)
-    save_training_log(log_dir, scores, avg_scores, losses, epsilons)
-    plot_training_log(log_dir, scores, avg_scores, losses)
+    save_training_log(log_dir, scores, avg_scores, losses, epsilons, eval_episodes, eval_scores)
+    plot_training_log(log_dir, scores, avg_scores, eval_episodes, eval_scores, solved_threshold)
 
 
 if __name__ == "__main__":
